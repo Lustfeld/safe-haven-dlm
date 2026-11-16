@@ -30,5 +30,8 @@ of the safe-haven dataset (originally Bloomberg / Refinitiv).
   the thesis; the notebooks use the daily change of this yield (percentage points)
   as the regressor.
 - Japan's interbank series starts in 2002, so JPY_3M has fewer observations.
+- The FRED exchange rates are noon buying rates in New York (H.10 release), while
+  the S&P 500, the VIX and the Treasury yield are end-of-day values. Notebook 02
+  checks what this timing gap does to the estimates.
 
 _Downloaded: 2026-08-13_

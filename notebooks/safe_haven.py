@@ -1,7 +1,7 @@
 """Shared inputs for the safe-haven notebooks.
 
 Every notebook regresses the same excess returns on the same five regressors, and
-notebooks 04-08 fit the same dynamic linear model. Defining that construction once
+notebooks 04-06 fit the same dynamic linear model. Defining that construction once
 keeps the notebooks from drifting apart. Paths are anchored to the repository root,
 so the notebooks do not depend on the working directory.
 """
@@ -22,7 +22,11 @@ CURRENCIES = ["CHF", "EUR", "GBP", "JPY"]
 RATE = {"CHF": "CHF_3M", "EUR": "EUR_3M", "GBP": "GBP_3M", "JPY": "JPY_3M"}
 REGRESSORS = ["SP500", "UST10Y", "fxvol", "TED", "VIX"]
 TERMS = ["const"] + REGRESSORS
-LAMBDA = 1e-3          # signal-to-noise r = W/V; larger => more time variation
+# Scale of the state innovations: W = LAMBDA * diag(Var(theta_OLS)). Each coefficient
+# moves by sqrt(LAMBDA) OLS standard errors per day, so over n days the random walk
+# has a prior standard deviation of sqrt(n * LAMBDA) standard errors - about 2.4 for
+# n = 5790. Larger => more time variation. Fixed, not estimated (see notebook 05).
+LAMBDA = 1e-3
 
 
 def load_levels():
@@ -80,9 +84,9 @@ def load_data():
 class DLM(sm.tsa.statespace.MLEModel):
     """Dynamic regression DLM: Y_t = F_t theta_t + v_t, theta_t = G theta_{t-1} + w_t."""
 
-    def __init__(self, Y, F, W, m0, C0):
+    def __init__(self, Y, F, W, m0, C0, burn=0):
         p = F.shape[1]
-        super().__init__(endog=Y, k_states=p, k_posdef=p)
+        super().__init__(endog=Y, k_states=p, k_posdef=p, loglikelihood_burn=burn)
         self["design"] = F.T.reshape(1, p, len(Y))   # F_t = (1, x_t')
         self["transition"] = np.eye(p)               # G_t = I_p  (random walk)
         self["selection"] = np.eye(p)
@@ -97,11 +101,13 @@ class DLM(sm.tsa.statespace.MLEModel):
     def start_params(self):
         return [np.var(self.endog)]
 
+    # V is of order 1e-5 for daily returns in decimals. Optimising over log V keeps
+    # the problem well scaled, so BFGS converges without warnings.
     def transform_params(self, u):
-        return u ** 2
+        return np.exp(u)
 
     def untransform_params(self, p):
-        return np.sqrt(np.abs(p))
+        return np.log(p)
 
     def update(self, params, **kwargs):
         params = super().update(params, **kwargs)
@@ -121,10 +127,33 @@ def dlm_inputs(df, lam=LAMBDA):
 def dlm_fit(df, lam=LAMBDA):
     """Fit the DLM on one regression frame; returns (results, full-sample OLS fit)."""
     Y, F, ols, C0, W = dlm_inputs(df, lam)
-    # BFGS may warn 'failed to converge': the likelihood in V is flat at machine
-    # precision near the optimum; the estimate and the smoothed states are
-    # unchanged under maxiter=500, so the warning is spurious.
     return DLM(Y, F, W, ols.params, C0).fit(disp=False), ols
+
+
+def joint_deviation(res, ols_params):
+    """Mahalanobis distance of the smoothed theta_t from the constant OLS estimate,
+    D_t = (theta_t - OLS)' C_t^{-1} (theta_t - OLS), C_t the smoothed state covariance."""
+    theta, cov = res.smoothed_state, res.smoothed_state_cov      # (p, n), (p, p, n)
+    d = theta - np.asarray(ols_params)[:, None]
+    return np.array([d[:, t] @ np.linalg.solve(cov[:, :, t], d[:, t])
+                     for t in range(theta.shape[1])])
+
+
+def dlm_profile(df, lams, burn=250):
+    """Log-likelihood of the DLM as a function of lambda, V re-estimated each time.
+
+    The headline fit starts the filter at the full-sample OLS estimate, which uses
+    the data twice. For a likelihood comparison that is not acceptable, so here the
+    initial state is vague (10^4 times the OLS variances) and the first `burn`
+    observations are left out of the likelihood while the filter settles.
+    """
+    Y, F, ols, C0, _ = dlm_inputs(df)
+    scale = np.diag(np.diag(C0))
+    out = {}
+    for lam in lams:
+        res = DLM(Y, F, lam * scale, ols.params, 1e4 * scale, burn=burn).fit(disp=False)
+        out[lam] = res.llf
+    return pd.Series(out, name="loglik")
 
 
 def prefix_gram(y, X):
